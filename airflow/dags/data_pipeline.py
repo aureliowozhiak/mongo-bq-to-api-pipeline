@@ -22,71 +22,76 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-def get_data_from_mongodb(**context):
-    """
-    Busca dados do MongoDB em lotes
-    """
-    mongo_hook = MongoHook(mongo_conn_id='mongo_default')
-    collection = mongo_hook.get_collection(
-        mongo_collection=Variable.get('MONGO_COLLECTION'),
-        mongo_db=Variable.get('MONGO_DB')
-    )
+def get_data_from_source(**context):
+    data_source = Variable.get('DATA_SOURCE', default_var='mongodb')
+    batch_size = int(Variable.get('BATCH_SIZE', default_var='500'))
     
-    # TODO: Implementar lógica de busca em lotes
-    return []
-
-def get_data_from_bigquery(**context):
-    """
-    Busca dados do BigQuery em lotes
-    """
-    bq_hook = BigQueryHook(gcp_conn_id='google_cloud_default')
+    if data_source == 'mongodb':
+        mongo_hook = MongoHook(conn_id='mongodb_default')
+        collection = mongo_hook.get_collection(
+            mongo_collection=Variable.get('MONGO_COLLECTION'),
+            mongo_db=Variable.get('MONGO_DB')
+        )
+        # Get total count for pagination
+        total_docs = collection.count_documents({})
+        return {'total': total_docs, 'batch_size': batch_size}
     
-    # TODO: Implementar lógica de busca em lotes
-    return []
+    elif data_source == 'bigquery':
+        bq_hook = BigQueryHook(gcp_conn_id='google_cloud_default')
+        query = f"""
+        SELECT COUNT(*) as total
+        FROM `{Variable.get('BQ_PROJECT_ID')}.{Variable.get('BQ_DATASET')}.{Variable.get('BQ_TABLE')}`
+        """
+        result = bq_hook.get_first(query)
+        return {'total': result[0], 'batch_size': batch_size}
 
 def process_batch(**context):
-    """
-    Processa um lote de registros e envia para a API
-    """
-    batch = context['task_instance'].xcom_pull(task_ids='fetch_data')
+    data_source = Variable.get('DATA_SOURCE', default_var='mongodb')
+    batch_size = int(Variable.get('BATCH_SIZE', default_var='500'))
     api_url = Variable.get('API_URL')
     
-    try:
-        response = requests.post(
-            f"{api_url}/api/v1/batch",
-            json={
-                "records": batch,
-                "batch_id": context['task_instance'].task_id
-            }
+    if data_source == 'mongodb':
+        mongo_hook = MongoHook(conn_id='mongodb_default')
+        collection = mongo_hook.get_collection(
+            mongo_collection=Variable.get('MONGO_COLLECTION'),
+            mongo_db=Variable.get('MONGO_DB')
         )
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logger.error(f"Erro ao processar lote: {str(e)}")
-        raise
+        # Get batch of documents
+        documents = list(collection.find().limit(batch_size))
+        data = [json.loads(json.dumps(doc, default=str)) for doc in documents]
+    
+    elif data_source == 'bigquery':
+        bq_hook = BigQueryHook(gcp_conn_id='google_cloud_default')
+        query = f"""
+        SELECT *
+        FROM `{Variable.get('BQ_PROJECT_ID')}.{Variable.get('BQ_DATASET')}.{Variable.get('BQ_TABLE')}`
+        LIMIT {batch_size}
+        """
+        data = bq_hook.get_pandas_df(query).to_dict('records')
+    
+    # Send to API
+    response = requests.post(api_url, json=data)
+    return response.json()
 
 # Cria a DAG
 with DAG(
     'data_pipeline',
     default_args=default_args,
-    description='Pipeline para processar dados do BigQuery/MongoDB para API',
+    description='Pipeline to process data from MongoDB/BigQuery to API',
     schedule_interval=timedelta(days=1),
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=['data_pipeline'],
 ) as dag:
 
-    # Determina a fonte de dados e busca os dados
-    fetch_data = PythonOperator(
-        task_id='fetch_data',
-        python_callable=get_data_from_mongodb if Variable.get('DATA_SOURCE') == 'mongodb' else get_data_from_bigquery,
+    get_data_info = PythonOperator(
+        task_id='get_data_info',
+        python_callable=get_data_from_source,
     )
 
-    # Processa e envia dados para a API
-    process_data = PythonOperator(
-        task_id='process_data',
+    process_batch = PythonOperator(
+        task_id='process_batch',
         python_callable=process_batch,
     )
 
-    # Define as dependências das tarefas
-    fetch_data >> process_data 
+    get_data_info >> process_batch 
